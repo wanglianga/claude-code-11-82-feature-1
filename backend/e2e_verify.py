@@ -1,11 +1,17 @@
 #!/usr/bin/env python3
-"""端到端验证：14/1 联合阻断、8/7 保留、撤回/到期拒新读、预算规则、算法升级、冻结复现。"""
+"""端到端验证：14/1 联合阻断、8/7 保留、撤回/到期拒新读、预算规则、算法升级、冻结复现、
+临床表型端点（三时点/窗口匹配/冲突裁定/补录不倒写/桥接报告）。"""
 import json
 import urllib.request
 import urllib.error
+from datetime import datetime, timezone
 
 BASE = "http://127.0.0.1:8080/api"
 PASS, FAIL = [], []
+
+
+def day_ms(text):
+    return int(datetime.strptime(text, "%Y-%m-%d").replace(tzinfo=timezone.utc).timestamp() * 1000)
 
 
 def call(method, path, token=None, body=None, expect_error=False):
@@ -207,6 +213,122 @@ check("零窄化不增加已用量", ledger_end["pointsSpent"] == 1, str(ledger_
 
 # 恢复空间默认上限，避免影响后续手工探索
 call("POST", "/admin/spaces/1/budget-cap", admin, {"quarterlyBudget": 10})
+
+# ---------- 场景四：临床表型端点（三时点/窗口匹配/冲突裁定/补录/桥接） ----------
+print("\n=== 场景四：稳定临床表型端点 ===")
+defs = {d["code"]: d for d in call("GET", "/endpoints/definitions", analyst)}
+strict_id = defs["EP-TTNT-STRICT"]["id"]
+priority_id = defs["EP-TTNT-PRIORITY"]["id"]
+check("两份预登记定义册已注册", "EP-TTNT-STRICT" in defs and "EP-TTNT-PRIORITY" in defs)
+
+# 4.1 严格锚点 @ 旧水线 WL-2026Q3
+trial_q3 = call("GET", f"/endpoints/trial?definitionId={strict_id}&waterlineLabel=WL-2026Q3", analyst)
+q3 = {p["patientKey"]: p for p in trial_q3["patients"]}
+check("严格模式 P007 窗内纳入", q3["P007"]["included"] is True)
+check("严格模式 P002 延迟检查出窗纳入损失",
+      q3["P002"]["included"] is False and q3["P002"]["exclusionReason"] == "IMAGING_OUTSIDE_WINDOW",
+      str(q3["P002"]["exclusionReason"]))
+check("严格模式 P004 影像未确认被拦截",
+      q3["P004"]["included"] is False and q3["P004"]["exclusionReason"] == "PENDING_CONFIRMATION")
+check("严格模式 P005 补录在旧水线不可见",
+      any(t["eventKey"] == "EVT-I-P005-A" and t["visibility"] == "NOT_VISIBLE_YET"
+          for t in q3["P005"]["timeline"]))
+check("严格模式 P006 缺治疗起点=INCOMPLETE",
+      q3["P006"]["included"] is False and q3["P006"]["exclusionReason"] == "NO_TREATMENT_START")
+check("严格模式 P008 确诊未确认不合格",
+      q3["P008"]["included"] is False and q3["P008"]["exclusionReason"] == "PENDING_CONFIRMATION")
+check("三时点在时间图中完整呈现",
+      all(set(["occurredAt", "recordedAt", "confirmedAt"]).issubset(t.keys())
+          for t in q3["P007"]["timeline"]))
+check("纳入损失统计含延迟损失计数", trial_q3["summary"]["delayedCheckLoss"] >= 1)
+
+# 4.2 双窗口冲突按预登记优先级裁定（P001 同检命中两窗口）
+arb = [a for a in trial_q3["arbitrations"] if a["patientKey"] == "P001"]
+check("P001 双窗口冲突被裁定且治疗窗优先",
+      arb and arb[0]["acceptedWindow"] == "TREATMENT_WINDOW"
+      and arb[0]["rejectedWindow"] == "DIAGNOSIS_WINDOW"
+      and arb[0]["basis"] == "PRE_REGISTERED_PRIORITY",
+      json.dumps(arb, ensure_ascii=False))
+check("P001 裁定后仍稳定纳入", q3["P001"]["included"] is True)
+
+# 4.3 优先级匹配：P003 延迟检查被扩展窗覆盖，候选全公开
+trial_pri = call("GET", f"/endpoints/trial?definitionId={priority_id}&waterlineLabel=WL-2026Q3", analyst)
+pq3 = {p["patientKey"]: p for p in trial_pri["patients"]}
+check("优先级模式 P003 扩展窗恢复纳入", pq3["P003"]["included"] is True,
+      str(pq3["P003"].get("exclusionReason")))
+cand_rows = [c for c in pq3["P003"]["candidates"] if c["eventKey"] == "EVT-I-P003-A"]
+check("优先级模式候选全部公开（含窗外标记）",
+      len(cand_rows) == 2 and any(c["inWindow"] is False for c in cand_rows)
+      and any(c["windowLabel"] == "EXTENDED_WINDOW" for c in cand_rows),
+      json.dumps(cand_rows, ensure_ascii=False))
+strict_p003 = q3["P003"]
+check("同一 P003 严格模式仍丢失（两策略差异公开）", strict_p003["included"] is False)
+
+# 4.4 冻结发表（旧水线）
+pub = call("POST", "/endpoints/publications", analyst,
+           {"definitionId": strict_id, "waterlineLabel": "WL-2026Q3"})
+check("端点发表冻结含 sha256", len(pub["payloadSha256"]) == 64 and pub["status"] == "FROZEN")
+frozen_p004 = [p for p in pub["payload"]["patients"] if p["patientKey"] == "P004"][0]
+check("发表载荷记录 P004 旧状态=未确认排除",
+      frozen_p004["included"] is False and frozen_p004["exclusionReason"] == "PENDING_CONFIRMATION")
+pub_id = pub["id"]
+
+# 4.5 定义册锁定：已有发表后改写被 409 拒绝
+code, locked = call("POST", "/admin/endpoints/definitions", admin,
+                    {"code": "EP-TTNT-STRICT", "name": "试图篡改窗口",
+                     "anchor": "FIRST_DIAGNOSIS", "reclassificationThreshold": 0.5,
+                     "components": []}, expect_error=True)
+check("已发表定义改写被拒绝", code == 409 and "冻结发表" in locked["error"], locked["error"])
+
+# 4.6 补录不倒写 + 桥接：新水线 WL-2026Q4 重算
+bridge = call("POST", f"/endpoints/publications/{pub_id}/bridge", analyst,
+              {"newWaterlineLabel": "WL-2026Q4"})
+rep = bridge["report"]
+check("桥接报告含 sha256 与裁决", len(bridge["reportSha256"]) == 64
+      and rep["decision"] in ("BRIDGE_REQUIRED", "CONTAINED"))
+check("重分类率 37.5% 超 10% 门限 => BRIDGE_REQUIRED（禁止静默复跑）",
+      rep["decision"] == "BRIDGE_REQUIRED"
+      and rep["reclassificationRate"] > rep["reclassificationThreshold"],
+      f"rate={rep['reclassificationRate']} threshold={rep['reclassificationThreshold']}")
+check("桥接识别 P004 重分类（未确认->纳入）",
+      any(r["patientKey"] == "P004" and r["category"] == "GAINED"
+          for r in rep["reclassifications"]),
+      json.dumps(rep["reclassifications"], ensure_ascii=False))
+check("桥接识别 P005 补录后新纳入",
+      any(r["patientKey"] == "P005" and r["newState"].startswith("INCLUDED")
+          for r in rep["reclassifications"]))
+check("桥接识别 P008 确诊确认后新纳入",
+      any(r["patientKey"] == "P008" for r in rep["reclassifications"]))
+# 旧发表载荷不变（补录不倒写）
+pub_again = call("GET", "/endpoints/publications", analyst)
+old = [p for p in pub_again if p["id"] == pub_id][0]
+old_p004 = [p for p in old["payload"]["patients"] if p["patientKey"] == "P004"][0]
+check("补录/重算未倒写旧发表（P004 仍为旧状态，哈希不变）",
+      old_p004["exclusionReason"] == "PENDING_CONFIRMATION"
+      and old["payloadSha256"] == pub["payloadSha256"])
+
+# 4.7 新水线试算验证三时点闸门放开
+trial_q4 = call("GET", f"/endpoints/trial?definitionId={strict_id}&waterlineLabel=WL-2026Q4", analyst)
+q4 = {p["patientKey"]: p for p in trial_q4["patients"]}
+check("新水线 P004/P005/P008 均可纳入",
+      all(q4[k]["included"] for k in ("P004", "P005", "P008")),
+      json.dumps({k: q4[k]["exclusionReason"] for k in ("P004", "P005", "P008")}, ensure_ascii=False))
+
+# 4.8 事件受理与确认的三时点留痕
+new_evt = call("POST", "/endpoints/events", analyst, {
+    "patientKey": "P007", "eventKey": "EVT-ADHOC-1", "eventType": "IMAGING",
+    "occurredAt": day_ms("2026-08-01"), "recordedAt": day_ms("2026-08-02"),
+    "confirmedAt": None, "modality": "CT", "bodyPart": "CHEST"})
+check("事件受理保留未确认状态", new_evt["confirmedAt"] is None)
+confirmed = call("POST", f"/endpoints/events/{new_evt['id']}/confirm", analyst)
+check("确认动作写入确认时点且不可二次改写", confirmed["confirmedAt"] is not None)
+code2, again = call("POST", f"/endpoints/events/{new_evt['id']}/confirm", analyst, expect_error=True)
+check("重复确认被 409 拒绝", code2 == 409 and "不可改写" in again["error"], again["error"])
+bf = call("POST", "/endpoints/events/backfill", analyst, {
+    "patientKey": "P002", "eventKey": "EVT-BF-P002-1", "eventType": "IMAGING",
+    "occurredAt": day_ms("2026-03-20"), "modality": "CT", "bodyPart": "CHEST",
+    "confirmedAt": day_ms("2026-11-01")})
+check("补录事件打 backfill 标记", bf["backfill"] is True and bf["recordedAt"] > bf["occurredAt"])
 
 print(f"\n汇总：PASS={len(PASS)} FAIL={len(FAIL)}")
 if FAIL:

@@ -5,6 +5,7 @@ import com.sandbox.imaging.domain.*;
 import com.sandbox.imaging.dto.ApprovalSpec;
 import com.sandbox.imaging.repo.*;
 import com.sandbox.imaging.service.ApprovalService;
+import com.sandbox.imaging.service.endpoint.EndpointService;
 import org.springframework.boot.CommandLineRunner;
 import org.springframework.security.crypto.password.PasswordEncoder;
 import org.springframework.stereotype.Component;
@@ -12,6 +13,7 @@ import org.springframework.transaction.annotation.Transactional;
 
 import java.time.LocalDate;
 import java.time.ZoneOffset;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 
@@ -34,6 +36,8 @@ public class DataSeeder implements CommandLineRunner {
     private final ImagingRecordRepository imagingRepo;
     private final ApprovalRepository approvalRepo;
     private final ApprovalService approvalService;
+    private final ClinicalEventRepository clinicalEventRepo;
+    private final EndpointService endpointService;
     private final PasswordEncoder encoder;
     private final ObjectMapper mapper;
 
@@ -41,6 +45,7 @@ public class DataSeeder implements CommandLineRunner {
                       WaterlineRepository waterlineRepo, PatientRepository patientRepo,
                       VisitRepository visitRepo, ImagingRecordRepository imagingRepo,
                       ApprovalRepository approvalRepo, ApprovalService approvalService,
+                      ClinicalEventRepository clinicalEventRepo, EndpointService endpointService,
                       PasswordEncoder encoder, ObjectMapper mapper) {
         this.userRepo = userRepo;
         this.spaceRepo = spaceRepo;
@@ -50,6 +55,8 @@ public class DataSeeder implements CommandLineRunner {
         this.imagingRepo = imagingRepo;
         this.approvalRepo = approvalRepo;
         this.approvalService = approvalService;
+        this.clinicalEventRepo = clinicalEventRepo;
+        this.endpointService = endpointService;
         this.encoder = encoder;
         this.mapper = mapper;
     }
@@ -125,6 +132,129 @@ public class DataSeeder implements CommandLineRunner {
         Approval ae = approvalService.compile(space.getId(), "APV-EXPIRED",
                 "已到期批准（到期拒新读演示）", expired);
         approvalService.activate(ae.getId());
+
+        seedEndpointPhenotypes();
+    }
+
+    // ---------- 临床表型端点种子 ----------
+
+    /**
+     * 端点演示证据（均为虚构结构化事件，无患者身份）：
+     * P001 双窗口冲突（同检命中治疗窗+诊断窗，预登记裁定归治疗窗）
+     * P002 延迟检查超出严格窗 => 严格模式纳入损失
+     * P003 延迟检查落在优先级扩展窗 => 严格丢失、优先级覆盖且候选公开
+     * P004 Q3 水线处影像可见但未确认，Q4 前完成确认
+     * P005 Q3 后补录影像（发生在 3 月、10 月才可见）=> 旧水线不可见，不倒写旧发表
+     * P006 只有确诊没有治疗起点 => INCOMPLETE
+     * P007 正常纳入
+     * P008 确诊 Q3 未确认、Q4 确认 => 旧水线不合格、新水线纳入
+     */
+    private void seedEndpointPhenotypes() {
+        if (clinicalEventRepo.count() > 0) return;
+        Map<String, Patient> pmap = new java.util.TreeMap<>();
+        for (Patient p : patientRepo.findAll()) pmap.put(p.getPatientKey(), p);
+
+        long diag = day(2026, 3, 2);
+        long tx = day(2026, 3, 12);
+
+        // 确诊与治疗起点（P006 刻意无治疗；P008 确诊延迟确认）
+        for (String key : List.of("P001", "P002", "P003", "P004", "P005", "P007")) {
+            seedEvent(pmap.get(key), "EVT-D-" + key, "DIAGNOSIS", diag, day(2026, 3, 3), day(2026, 3, 4), null, null, false, null);
+            seedEvent(pmap.get(key), "EVT-T-" + key, "TREATMENT", tx, day(2026, 3, 13), day(2026, 3, 14), "CHEMO", null, false, null);
+        }
+        // P008：确诊 10 月才确认；治疗与影像早已确认
+        seedEvent(pmap.get("P008"), "EVT-D-P008", "DIAGNOSIS", diag, day(2026, 3, 3), day(2026, 10, 20), null, null, false, null);
+        seedEvent(pmap.get("P008"), "EVT-T-P008", "TREATMENT", tx, day(2026, 3, 13), day(2026, 3, 14), "CHEMO", null, false, null);
+        // P006：仅确诊
+        seedEvent(pmap.get("P006"), "EVT-D-P006", "DIAGNOSIS", diag, day(2026, 3, 3), day(2026, 3, 4), null, null, false, null);
+
+        // P001：两次检查同时落在治疗窗与诊断窗 -> 双窗口冲突裁定
+        seedEvent(pmap.get("P001"), "EVT-I-P001-A", "IMAGING", day(2026, 3, 20), day(2026, 3, 21), day(2026, 3, 22), "CT", "CHEST", false, null);
+        seedEvent(pmap.get("P001"), "EVT-I-P001-B", "IMAGING", day(2026, 3, 25), day(2026, 3, 26), day(2026, 3, 27), "CT", "CHEST", false, null);
+        // P007：正常
+        seedEvent(pmap.get("P007"), "EVT-I-P007-A", "IMAGING", day(2026, 3, 18), day(2026, 3, 19), day(2026, 3, 20), "CT", "CHEST", false, null);
+        seedEvent(pmap.get("P007"), "EVT-I-P007-B", "IMAGING", day(2026, 3, 24), day(2026, 3, 25), day(2026, 3, 26), "CT", "CHEST", false, null);
+        // P002：延迟检查，治疗后第 39/41 天，超出严格 28 天与诊断 30 天窗
+        seedEvent(pmap.get("P002"), "EVT-I-P002-A", "IMAGING", day(2026, 4, 20), day(2026, 4, 21), day(2026, 4, 22), "CT", "CHEST", false, null);
+        seedEvent(pmap.get("P002"), "EVT-I-P002-B", "IMAGING", day(2026, 4, 22), day(2026, 4, 23), day(2026, 4, 24), "CT", "CHEST", false, null);
+        // P003：更晚的延迟检查，落在治疗后 60 天扩展窗内，严格模式仍出窗
+        seedEvent(pmap.get("P003"), "EVT-I-P003-A", "IMAGING", day(2026, 5, 5), day(2026, 5, 6), day(2026, 5, 7), "CT", "CHEST", false, null);
+        seedEvent(pmap.get("P003"), "EVT-I-P003-B", "IMAGING", day(2026, 5, 8), day(2026, 5, 9), day(2026, 5, 10), "CT", "CHEST", false, null);
+        // P004：影像 Q3 可见但未确认，10 月 15 日才确认（Q4 水线前）
+        seedEvent(pmap.get("P004"), "EVT-I-P004-A", "IMAGING", day(2026, 3, 20), day(2026, 3, 21), day(2026, 10, 15), "CT", "CHEST", false, null);
+        seedEvent(pmap.get("P004"), "EVT-I-P004-B", "IMAGING", day(2026, 3, 25), day(2026, 3, 26), day(2026, 3, 27), "CT", "CHEST", false, null);
+        // P005：补录证据，事实发生在 3 月，10 月才记录可见并确认
+        seedEvent(pmap.get("P005"), "EVT-I-P005-A", "IMAGING", day(2026, 3, 20), day(2026, 10, 5), day(2026, 10, 6), "CT", "CHEST", true, null);
+        seedEvent(pmap.get("P005"), "EVT-I-P005-B", "IMAGING", day(2026, 3, 25), day(2026, 10, 5), day(2026, 10, 6), "CT", "CHEST", true, null);
+        // P008：影像正常确认，等待确诊确认
+        seedEvent(pmap.get("P008"), "EVT-I-P008-A", "IMAGING", day(2026, 3, 20), day(2026, 3, 21), day(2026, 3, 22), "CT", "CHEST", false, null);
+        seedEvent(pmap.get("P008"), "EVT-I-P008-B", "IMAGING", day(2026, 3, 25), day(2026, 3, 26), day(2026, 3, 27), "CT", "CHEST", false, null);
+
+        // 定义册一：严格锚点（治疗窗 -7/+28，诊断窗 0/+30），重分类门限 10%
+        Map<String, Object> strict = new java.util.TreeMap<>();
+        strict.put("code", "EP-TTNT-STRICT");
+        strict.put("name", "治疗起点影像表型（严格锚点窗口）");
+        strict.put("anchor", "FIRST_DIAGNOSIS");
+        strict.put("reclassificationThreshold", 0.10);
+        strict.put("components", List.of(
+                comp("C_DIAG", "DIAGNOSIS", true, null, "STRICT_ANCHOR", null),
+                comp("C_TX", "TREATMENT", true, null, "STRICT_ANCHOR", null),
+                comp("C_IMG", "IMAGING", true, "CT", "STRICT_ANCHOR",
+                        window("TREATMENT_WINDOW", "TREATMENT", 7, 28)),
+                comp("C_IMG_DX", "IMAGING", true, "CT", "STRICT_ANCHOR",
+                        window("DIAGNOSIS_WINDOW", "DIAGNOSIS", 0, 30))));
+        strict.put("conflictPolicy", Map.of("IMAGING", List.of("TREATMENT_WINDOW", "DIAGNOSIS_WINDOW")));
+        endpointService.registerDefinition(1L, strict);
+
+        // 定义册二：优先级匹配（扩展窗 -0/+60），候选全部公开，门限 20%
+        Map<String, Object> priority = new java.util.TreeMap<>();
+        priority.put("code", "EP-TTNT-PRIORITY");
+        priority.put("name", "治疗起点影像表型（优先级匹配+扩展窗）");
+        priority.put("anchor", "FIRST_DIAGNOSIS");
+        priority.put("reclassificationThreshold", 0.20);
+        priority.put("components", List.of(
+                comp("C_DIAG", "DIAGNOSIS", true, null, "STRICT_ANCHOR", null),
+                comp("C_TX", "TREATMENT", true, null, "STRICT_ANCHOR", null),
+                compPriority("C_IMG", "IMAGING", "CT",
+                        List.of(window("TREATMENT_WINDOW", "TREATMENT", 7, 28),
+                                window("EXTENDED_WINDOW", "TREATMENT", 0, 60)))));
+        priority.put("conflictPolicy", Map.of("IMAGING", List.of("TREATMENT_WINDOW", "EXTENDED_WINDOW")));
+        endpointService.registerDefinition(1L, priority);
+    }
+
+    private void seedEvent(Patient patient, String key, String type, long occurred,
+                           long recorded, Long confirmed, String modality, String bodyPart,
+                           boolean backfill, String amends) {
+        clinicalEventRepo.save(new ClinicalEvent(patient, key, type, occurred, recorded, confirmed,
+                modality, bodyPart, backfill, amends));
+    }
+
+    private Map<String, Object> window(String label, String ref, int before, int after) {
+        return Map.of("label", label, "ref", ref, "beforeDays", before, "afterDays", after);
+    }
+
+    private Map<String, Object> comp(String code, String type, boolean requireConfirmed,
+                                     String modality, String strategy, Map<String, Object> window) {
+        Map<String, Object> m = new java.util.TreeMap<>();
+        m.put("code", code);
+        m.put("type", type);
+        m.put("requireConfirmed", requireConfirmed);
+        if (modality != null) m.put("modality", modality);
+        m.put("matchStrategy", strategy);
+        if (window != null) m.put("window", window);
+        return m;
+    }
+
+    private Map<String, Object> compPriority(String code, String type, String modality,
+                                             List<Map<String, Object>> windows) {
+        Map<String, Object> m = new java.util.TreeMap<>();
+        m.put("code", code);
+        m.put("type", type);
+        m.put("requireConfirmed", true);
+        m.put("modality", modality);
+        m.put("matchStrategy", "PRIORITY");
+        m.put("windows", windows);
+        return m;
     }
 
     private void seedPeriod(List<Patient> patients, int year, int monthFrom, int monthTo,

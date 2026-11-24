@@ -10,6 +10,7 @@ const routes = [
       { path: 'scenarios', component: () => import('./views/ScenariosView.vue') },
       { path: 'approvals', component: () => import('./views/ApprovalsView.vue') },
       { path: 'cohorts', component: () => import('./views/CohortsView.vue') },
+      { path: 'endpoints', component: () => import('./views/EndpointsView.vue') },
       { path: 'query', component: () => import('./views/QueryView.vue') },
       { path: 'table-sets', component: () => import('./views/TableSetView.vue') },
       { path: 'deliverables', component: () => import('./views/DeliverablesView.vue') },

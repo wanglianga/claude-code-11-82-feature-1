@@ -6,6 +6,7 @@
         <RouterLink to="/scenarios">场景验证导览</RouterLink>
         <RouterLink to="/approvals">批准与分析版本</RouterLink>
         <RouterLink to="/cohorts">队列复现</RouterLink>
+        <RouterLink to="/endpoints">临床表型端点</RouterLink>
         <RouterLink to="/query">交互查询审查</RouterLink>
         <RouterLink to="/table-sets">固定表组核验</RouterLink>
         <RouterLink to="/deliverables">交付与复现台账</RouterLink>
